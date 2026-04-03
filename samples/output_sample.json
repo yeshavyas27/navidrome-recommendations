@@ -1,0 +1,98 @@
+{
+  "user_id": "user_42",
+  "recommendations": [
+    {
+      "song_id": "song_334ab",
+      "title": "Under the Bridge",
+      "artist": "Red Hot Chili Peppers",
+      "album": "Blood Sugar Sex Magik",
+      "genre": "rock",
+      "score": 0.9421,
+      "method": "collaborative_filtering"
+    },
+    {
+      "song_id": "song_891cd",
+      "title": "Creep",
+      "artist": "Radiohead",
+      "album": "Pablo Honey",
+      "genre": "alternative",
+      "score": 0.9108,
+      "method": "hybrid"
+    },
+    {
+      "song_id": "song_004ef",
+      "title": "Black Hole Sun",
+      "artist": "Soundgarden",
+      "album": "Superunknown",
+      "genre": "rock",
+      "score": 0.8973,
+      "method": "collaborative_filtering"
+    },
+    {
+      "song_id": "song_217gh",
+      "title": "Come As You Are",
+      "artist": "Nirvana",
+      "album": "Nevermind",
+      "genre": "alternative",
+      "score": 0.8815,
+      "method": "content_based"
+    },
+    {
+      "song_id": "song_553ij",
+      "title": "Everlong",
+      "artist": "Foo Fighters",
+      "album": "The Colour and the Shape",
+      "genre": "rock",
+      "score": 0.8742,
+      "method": "collaborative_filtering"
+    },
+    {
+      "song_id": "song_092kl",
+      "title": "Yellow",
+      "artist": "Coldplay",
+      "album": "Parachutes",
+      "genre": "alternative",
+      "score": 0.8601,
+      "method": "hybrid"
+    },
+    {
+      "song_id": "song_771mn",
+      "title": "With or Without You",
+      "artist": "U2",
+      "album": "The Joshua Tree",
+      "genre": "rock",
+      "score": 0.8499,
+      "method": "collaborative_filtering"
+    },
+    {
+      "song_id": "song_438op",
+      "title": "Mr. Brightside",
+      "artist": "The Killers",
+      "album": "Hot Fuss",
+      "genre": "alternative",
+      "score": 0.8344,
+      "method": "hybrid"
+    },
+    {
+      "song_id": "song_125qr",
+      "title": "Seven Nation Army",
+      "artist": "The White Stripes",
+      "album": "Elephant",
+      "genre": "rock",
+      "score": 0.8271,
+      "method": "collaborative_filtering"
+    },
+    {
+      "song_id": "song_662st",
+      "title": "Knights of Cydonia",
+      "artist": "Muse",
+      "album": "Black Holes and Revelations",
+      "genre": "rock",
+      "score": 0.8188,
+      "method": "hybrid"
+    }
+  ],
+  "model_version": "v0.1.0-dummy",
+  "generated_at": "2026-04-01T10:30:00.412Z",
+  "inference_latency_ms": 42.7
+}

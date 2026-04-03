@@ -1,0 +1,14 @@
+{
+  "user_id": "user_42",
+  "n_recommendations": 10,
+  "context": {
+    "current_song_id": "song_12ghi",
+    "session_history": ["song_78abc", "song_91def", "song_12ghi"],
+    "timestamp": "2026-04-01T10:30:00Z"
+  },
+  "user_features": {
+    "favorite_genres": ["rock", "alternative"],
+    "avg_session_length_mins": 45.2,
+    "total_plays": 1823
+  }
+}
