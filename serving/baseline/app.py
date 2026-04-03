@@ -61,7 +61,7 @@ def health():
     return {"status": "ok"}
 
 
-# ---- Recommendation endpoint (lab: @app.post("/predict")) ----
+#Recommendation endpoint (lab: @app.post("/predict"))
 @app.post("/recommend", response_model=RecommendResponse)
 def recommend(request: RecommendRequest):
 
