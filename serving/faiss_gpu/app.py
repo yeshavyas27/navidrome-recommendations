@@ -10,6 +10,10 @@ from pydantic import BaseModel
 import numpy as np
 import faiss
 import time
+import threading
+
+# FAISS GPU is not thread-safe — serialize concurrent searches
+faiss_lock = threading.Lock()
 
 #App setup
 app = FastAPI(
@@ -74,9 +78,10 @@ def recommend(request: RecommendRequest):
     # Step 1: Map user_id to an index (same as baseline)
     user_idx = hash(request.user_id) % NUM_USERS
 
-    # Step 2: FAISS GPU search (same call as CPU, but runs on GPU)
+    # Step 2: FAISS GPU search (lock required — not thread-safe)
     user_vector = user_embeddings[user_idx].reshape(1, -1)
-    scores, top_k_indices = faiss_index.search(user_vector, request.n_recommendations)
+    with faiss_lock:
+        scores, top_k_indices = faiss_index.search(user_vector, request.n_recommendations)
     scores = scores[0]
     top_k_indices = top_k_indices[0]
 
