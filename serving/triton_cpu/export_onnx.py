@@ -45,7 +45,6 @@ torch.onnx.export(
         "user_embedding": {0: "batch_size"},
         "scores": {0: "batch_size"},
     },
-    dynamo=False,  # Use legacy TorchScript exporter (more stable for simple models)
 )
 
 print(f"ONNX model exported to {onnx_path}")
