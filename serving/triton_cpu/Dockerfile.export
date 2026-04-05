@@ -4,7 +4,7 @@ FROM python:3.11-slim
 
 WORKDIR /workspace
 
-RUN pip install --no-cache-dir torch numpy onnxscript onnx
+RUN pip install --no-cache-dir torch==2.1.0 numpy==1.26.4 onnx==1.15.0
 
 COPY export_onnx.py .
 
