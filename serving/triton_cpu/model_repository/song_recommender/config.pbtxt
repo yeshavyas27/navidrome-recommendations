@@ -1,0 +1,34 @@
+# Triton CPU model config
+# Difference from triton_gpu: KIND_CPU instead of KIND_GPU
+name: "song_recommender"
+platform: "onnxruntime_onnx"
+
+input [
+  {
+    name: "user_embedding"
+    data_type: TYPE_FP32
+    dims: [ 64 ]
+  }
+]
+
+output [
+  {
+    name: "scores"
+    data_type: TYPE_FP32
+    dims: [ 10000 ]
+  }
+]
+
+# Run on CPU
+instance_group [
+  {
+    count: 1
+    kind: KIND_CPU
+  }
+]
+
+# Dynamic batching — groups requests arriving within 5ms into one batch
+# This is the main benefit of Triton over FastAPI
+dynamic_batching {
+  max_queue_delay_microseconds: 5000
+}
