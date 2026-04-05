@@ -1,0 +1,14 @@
+# One-time ONNX export container for Triton GPU
+# Same as triton_cpu/Dockerfile.export — the ONNX model is identical,
+# only the Triton config differs (KIND_GPU vs KIND_CPU)
+FROM python:3.11-slim
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir torch==2.1.0 numpy==1.26.4 onnx==1.15.0
+
+COPY export_onnx.py .
+
+RUN mkdir -p model_repository/song_recommender/1
+
+CMD ["python", "export_onnx.py"]

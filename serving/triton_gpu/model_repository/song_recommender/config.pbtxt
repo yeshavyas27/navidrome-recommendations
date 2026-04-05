@@ -1,6 +1,7 @@
 # Triton model config (same pattern as lab's food_classifier_onnx/config.pbtxt)
 name: "song_recommender"
 platform: "onnxruntime_onnx"
+max_batch_size: 32
 
 input [
   {
