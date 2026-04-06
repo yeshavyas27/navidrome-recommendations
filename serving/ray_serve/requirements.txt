@@ -1,0 +1,4 @@
+ray[serve]==2.9.0
+numpy==1.26.4
+faiss-cpu==1.8.0
+packaging
