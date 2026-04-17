@@ -26,7 +26,7 @@ output [
   {
     name: "session_repr"
     data_type: TYPE_FP32
-    dims: [ 128 ]
+    dims: [ 64 ]
   }
 ]
 

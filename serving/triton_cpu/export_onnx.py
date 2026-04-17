@@ -72,15 +72,18 @@ class GRU4RecEncoder(nn.Module):
         self.gru = model.gru
         self.dropout = model.dropout
         self.output_proj = model.output_proj
+        self.layer_norm = model.layer_norm if hasattr(model, "layer_norm") else None
 
     def forward(self, prefix_item_idxs: torch.Tensor) -> torch.Tensor:
         # prefix_item_idxs: (batch, seq_len) — should be truncated
         # to real length (no trailing padding) for exact results.
 
-        x = self.item_emb(prefix_item_idxs)      # (batch, seq, 128)
-        _, h_n = self.gru(x)                      # h_n: (num_layers, batch, 256)
-        h_last = self.dropout(h_n[-1])            # last layer: (batch, 256)
-        session_repr = self.output_proj(h_last)   # (batch, 128)
+        x = self.item_emb(prefix_item_idxs)      # (batch, seq, 64)
+        _, h_n = self.gru(x)                      # h_n: (num_layers, batch, 128)
+        h_last = self.dropout(h_n[-1])            # last layer: (batch, 128)
+        session_repr = self.output_proj(h_last)   # (batch, 64)
+        if self.layer_norm is not None:
+            session_repr = self.layer_norm(session_repr)
         return session_repr
 
 
