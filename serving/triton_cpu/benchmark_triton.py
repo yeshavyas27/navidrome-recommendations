@@ -22,34 +22,69 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def benchmark_triton_direct(url, num_requests, concurrency):
-    """Benchmark Triton encoder directly via HTTP inference API."""
-    import tritonclient.http as httpclient
+    """Benchmark Triton encoder directly via HTTP inference API.
 
-    client = httpclient.InferenceServerClient(url=url)
-    prefix = np.array([[1, 2, 3, 4, 5]], dtype=np.int64)
+    Uses multiprocessing instead of threads because tritonclient
+    uses gevent internally, which conflicts with ThreadPoolExecutor.
+    For concurrency=1, runs sequentially for accurate single-request latency.
+    """
+    import subprocess, json
 
-    # Warmup
-    for _ in range(10):
-        inp = httpclient.InferInput("prefix_item_idxs", prefix.shape, "INT64")
-        inp.set_data_from_numpy(prefix)
-        out = httpclient.InferRequestedOutput("session_repr")
-        client.infer(model_name="gru4rec_encoder", inputs=[inp], outputs=[out])
+    prefix = [1, 2, 3, 4, 5]
 
-    def send():
-        inp = httpclient.InferInput("prefix_item_idxs", prefix.shape, "INT64")
-        inp.set_data_from_numpy(prefix)
-        out = httpclient.InferRequestedOutput("session_repr")
-        t0 = time.time()
-        client.infer(model_name="gru4rec_encoder", inputs=[inp], outputs=[out])
-        return time.time() - t0
+    # Write a small worker script that each process runs
+    worker_code = f'''
+import tritonclient.http as httpclient
+import numpy as np
+import time, json, sys
 
-    times = []
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futures = [ex.submit(send) for _ in range(num_requests)]
-        for f in as_completed(futures):
-            times.append(f.result())
+url = "{url}"
+n = int(sys.argv[1])
+client = httpclient.InferenceServerClient(url=url)
+prefix = np.array([[{",".join(str(x) for x in prefix)}]], dtype=np.int64)
 
-    return np.array(times)
+# Warmup
+for _ in range(5):
+    inp = httpclient.InferInput("prefix_item_idxs", prefix.shape, "INT64")
+    inp.set_data_from_numpy(prefix)
+    out = httpclient.InferRequestedOutput("session_repr")
+    client.infer(model_name="gru4rec_encoder", inputs=[inp], outputs=[out])
+
+times = []
+for _ in range(n):
+    inp = httpclient.InferInput("prefix_item_idxs", prefix.shape, "INT64")
+    inp.set_data_from_numpy(prefix)
+    out = httpclient.InferRequestedOutput("session_repr")
+    t0 = time.time()
+    client.infer(model_name="gru4rec_encoder", inputs=[inp], outputs=[out])
+    times.append(time.time() - t0)
+
+print(json.dumps(times))
+'''
+
+    import tempfile, os
+    script_path = tempfile.mktemp(suffix=".py")
+    with open(script_path, "w") as f:
+        f.write(worker_code)
+
+    reqs_per_worker = num_requests // concurrency
+
+    # Launch concurrent processes
+    procs = []
+    for _ in range(concurrency):
+        p = subprocess.Popen(
+            ["python", script_path, str(reqs_per_worker)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        procs.append(p)
+
+    all_times = []
+    for p in procs:
+        stdout, _ = p.communicate()
+        all_times.extend(json.loads(stdout.decode()))
+
+    os.unlink(script_path)
+    return np.array(all_times)
 
 
 def benchmark_e2e(url, num_requests, concurrency):
