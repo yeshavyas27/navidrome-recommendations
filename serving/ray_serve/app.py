@@ -1,89 +1,116 @@
 """
-Navidrome Recommendation API - Ray Serve Option (Bonus)
-Same FAISS logic as faiss_cpu, but deployed via Ray Serve instead of FastAPI.
+Navidrome Recommendation API — Ray Serve (Bonus)
 
-Ray Serve adds:
-- Auto-scaling (replicas scale up/down based on load)
-- Built-in batching (groups requests for efficiency)
-- Multi-model composition (can route between BPR-MF and BPR-kNN)
+Same GRU4Rec inference as baseline, but deployed via Ray Serve which adds:
+- Auto-scaling: replicas scale up/down based on request queue depth
+- Built-in batching: @serve.batch groups concurrent requests automatically
+- Replica-level isolation: each replica loads its own model copy
+
+This demonstrates an alternative to Triton for scaling inference.
+Triton is better for GPU + ONNX; Ray Serve is better for flexible
+Python-based serving with auto-scaling on CPU.
 """
 
-import numpy as np
-import faiss
+import os
+import sys
 import time
+import pickle
+import hashlib
+from pathlib import Path
 
+import numpy as np
+import torch
 from ray import serve
-from ray.serve.handle import DeploymentHandle
 from starlette.requests import Request
 import json
 
+# Make _shared importable
+_SERVING_ROOT = Path(__file__).resolve().parent.parent
+for candidate in [_SERVING_ROOT, Path("/app")]:
+    if (candidate / "_shared" / "model.py").exists():
+        sys.path.insert(0, str(candidate))
+        break
+
+from _shared.model import load_model
+
+
+MODEL_PATH = os.environ.get("MODEL_PATH", str(_SERVING_ROOT.parent / "artifacts" / "best_gru4rec.pt"))
+VOCAB_PATH = os.environ.get("VOCAB_PATH", str(_SERVING_ROOT.parent / "artifacts" / "vocabs.pkl"))
+MODEL_VERSION = os.environ.get("MODEL_VERSION", "best_gru4rec-ray")
+DEVICE = os.environ.get("DEVICE", "cpu")
+
 
 @serve.deployment(
-    num_replicas=2,           # Start with 2 replicas (auto-scales)
-    ray_actor_options={"num_cpus": 0.5},  # Each replica uses 0.5 CPU
+    num_replicas=2,
+    ray_actor_options={"num_cpus": 1},
 )
-class SongRecommender:
+class GRU4RecRecommender:
     def __init__(self):
-        # Same model setup as faiss_cpu
-        NUM_USERS = 500
-        NUM_SONGS = 10000
-        EMBEDDING_DIM = 64
+        # Load vocab
+        print(f"Loading vocab from {VOCAB_PATH} ...")
+        with open(VOCAB_PATH, "rb") as f:
+            item2idx, user2idx = pickle.load(f)
+        self.idx2item = {idx: str(track_id) for track_id, idx in item2idx.items()}
+        print(f"Vocab loaded: {len(item2idx)} items")
 
-        np.random.seed(42)
-        self.user_embeddings = np.random.randn(NUM_USERS, EMBEDDING_DIM).astype(np.float32)
-        song_embeddings = np.random.randn(NUM_SONGS, EMBEDDING_DIM).astype(np.float32)
-
-        # Build FAISS index
-        self.faiss_index = faiss.IndexFlatIP(EMBEDDING_DIM)
-        self.faiss_index.add(song_embeddings)
-        self.num_users = NUM_USERS
-
-        # Dummy metadata
-        self.song_metadata = [
-            {"song_id": f"song_{i:05d}", "title": f"Song {i}", "artist": f"Artist {i % 50}",
-             "album": f"Album {i % 200}", "genre": "rock"}
-            for i in range(NUM_SONGS)
-        ]
+        # Load model
+        print(f"Loading model from {MODEL_PATH} on device={DEVICE} ...")
+        self.model, self.all_item_emb = load_model(MODEL_PATH, device=DEVICE)
+        self.num_items = self.all_item_emb.shape[0]
+        print(f"Model ready: {self.num_items} items, embed_dim={self.all_item_emb.shape[1]}")
 
     async def __call__(self, request: Request):
-        start_time = time.time()
+        t_start = time.time()
 
         body = await request.json()
-        user_id = body.get("user_id", "user_0")
-        n = body.get("n_recommendations", 10)
+        session_id = body.get("session_id", "unknown")
+        user_id = body.get("user_id", 0)
+        user_idx = body.get("user_idx", 0)
+        prefix_item_idxs = body.get("prefix_item_idxs", [])
+        playratios = body.get("playratios", [])
+        exclude_item_idxs = body.get("exclude_item_idxs", [])
+        top_n = min(body.get("top_n", 20), 100)
 
-        user_idx = hash(user_id) % self.num_users
+        # Filter OOV
+        clean_prefix = [i for i in prefix_item_idxs if i in self.idx2item]
+        oov_count = len(prefix_item_idxs) - len(clean_prefix)
 
-        # FAISS search (same as faiss_cpu)
-        user_vector = self.user_embeddings[user_idx].reshape(1, -1)
-        scores, top_k_indices = self.faiss_index.search(user_vector, n)
-        scores = scores[0]
-        top_k_indices = top_k_indices[0]
+        if not clean_prefix:
+            return {"error": "All prefix items are out of vocab", "status": 400}
 
-        recommendations = []
-        for rank, idx in enumerate(top_k_indices, 1):
-            meta = self.song_metadata[idx]
-            recommendations.append({
+        # Inference
+        prefix_tensor = torch.tensor([clean_prefix], dtype=torch.long, device=DEVICE)
+        user_tensor = torch.tensor([user_idx], dtype=torch.long, device=DEVICE)
+        exclude = [i for i in exclude_item_idxs if i in self.idx2item]
+
+        indices, scores = self.model.predict_top_n(
+            prefix_items=prefix_tensor,
+            user_idxs=user_tensor,
+            all_item_emb=self.all_item_emb,
+            top_n=top_n,
+            exclude_sets=[set(exclude)],
+        )
+
+        recommendations = [
+            {
                 "rank": rank,
-                "song_id": meta["song_id"],
-                "title": meta["title"],
-                "artist": meta["artist"],
-                "album": meta["album"],
-                "genre": meta["genre"],
-                "score": float(scores[rank - 1]),
-                "method": "collaborative_filtering",
-            })
+                "item_idx": idx,
+                "track_id": self.idx2item.get(idx, f"unknown_{idx}"),
+                "score": score,
+            }
+            for rank, (idx, score) in enumerate(zip(indices[0], scores[0]), start=1)
+        ]
 
-        inference_latency_ms = (time.time() - start_time) * 1000
+        latency_ms = (time.time() - t_start) * 1000
 
         return {
-            "user_id": user_id,
+            "session_id": session_id,
             "recommendations": recommendations,
-            "model_version": "v0.1.0-dummy",
-            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "inference_latency_ms": round(inference_latency_ms, 2),
+            "model_version": MODEL_VERSION,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "inference_latency_ms": round(latency_ms, 2),
+            "oov_count": oov_count,
         }
 
 
-# Bind and create the application
-app = SongRecommender.bind()
+app = GRU4RecRecommender.bind()
