@@ -58,7 +58,13 @@ VOCAB_PATH     = os.environ.get(
     "VOCAB_PATH",
     str(_SERVING_ROOT.parent / "artifacts" / "vocabs.pkl"),
 )
-MODEL_VERSION  = os.environ.get("MODEL_VERSION", "best_gru4rec-adapter")
+MODEL_VERSION  = os.environ.get("MODEL_VERSION", "best_gru4rec")
+
+# MLflow: if set, pull model artifact from MLflow instead of local file.
+# Set MLFLOW_TRACKING_URI to enable (e.g. http://129.114.25.168:8000).
+MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "")
+MLFLOW_EXPERIMENT   = os.environ.get("MLFLOW_EXPERIMENT", "30music-session-recommendation")
+MLFLOW_ARTIFACT     = os.environ.get("MLFLOW_ARTIFACT", "best_gru4rec.pt")
 DEVICE         = os.environ.get("DEVICE", "cpu")
 MAX_PREFIX_LEN = int(os.environ.get("MAX_PREFIX_LEN", "200"))
 MAX_TOP_N      = int(os.environ.get("MAX_TOP_N", "100"))
@@ -142,21 +148,86 @@ class RecommendResponse(BaseModel):
 state: dict = {}
 
 
+def _fetch_model_from_mlflow() -> str:
+    """Download the latest model artifact from MLflow and return local path.
+
+    Queries the MLflow experiment for the most recent run, then downloads
+    the model .pt file to a local cache directory. This is what enables
+    the retrain → redeploy loop: Yesha trains a new model → logs it to
+    MLflow → this service pulls it on next startup.
+    """
+    import requests as http_requests
+
+    log.info(f"Fetching model from MLflow at {MLFLOW_TRACKING_URI} ...")
+
+    # Find the latest run in the experiment
+    exp_resp = http_requests.get(
+        f"{MLFLOW_TRACKING_URI}/api/2.0/mlflow/experiments/get-by-name",
+        params={"experiment_name": MLFLOW_EXPERIMENT},
+    )
+    exp_resp.raise_for_status()
+    experiment_id = exp_resp.json()["experiment"]["experiment_id"]
+
+    runs_resp = http_requests.post(
+        f"{MLFLOW_TRACKING_URI}/api/2.0/mlflow/runs/search",
+        json={
+            "experiment_ids": [experiment_id],
+            "max_results": 1,
+            "order_by": ["start_time DESC"],
+        },
+    )
+    runs_resp.raise_for_status()
+    runs = runs_resp.json().get("runs", [])
+    if not runs:
+        raise RuntimeError(f"No runs found in MLflow experiment '{MLFLOW_EXPERIMENT}'")
+
+    run_id = runs[0]["info"]["run_id"]
+    run_name = runs[0]["info"].get("run_name", run_id)
+    log.info(f"Found MLflow run: {run_name} (id={run_id})")
+
+    # Download the artifact
+    cache_dir = Path("/tmp/mlflow_cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    local_path = cache_dir / f"{run_id}_{MLFLOW_ARTIFACT}"
+
+    if local_path.exists():
+        log.info(f"Using cached artifact: {local_path}")
+        return str(local_path)
+
+    artifact_url = (
+        f"{MLFLOW_TRACKING_URI}/get-artifact"
+        f"?run_id={run_id}&path={MLFLOW_ARTIFACT}"
+    )
+    log.info(f"Downloading {MLFLOW_ARTIFACT} from run {run_name} ...")
+    resp = http_requests.get(artifact_url, stream=True)
+    resp.raise_for_status()
+    with open(local_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+    log.info(f"Downloaded to {local_path} ({local_path.stat().st_size / 1e6:.1f} MB)")
+
+    return str(local_path)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Load vocab (item2idx, user2idx) from Yesha's training cache.
     log.info(f"Loading vocab from {VOCAB_PATH} ...")
     with open(VOCAB_PATH, "rb") as f:
         item2idx, user2idx = pickle.load(f)
-    # Build reverse mapping: idx → track_id (as string for JSON response)
     idx2item = {idx: str(track_id) for track_id, idx in item2idx.items()}
     state["item2idx"] = item2idx
     state["idx2item"] = idx2item
     log.info(f"Vocab loaded: {len(item2idx)} items, {len(user2idx)} users")
 
-    log.info(f"Loading model from {MODEL_PATH} on device={DEVICE} ...")
+    # Load model: from MLflow if configured, otherwise from local file.
+    model_path = MODEL_PATH
+    if MLFLOW_TRACKING_URI:
+        model_path = _fetch_model_from_mlflow()
+
+    log.info(f"Loading model from {model_path} on device={DEVICE} ...")
     t0 = time.time()
-    model, all_item_emb = load_model(MODEL_PATH, device=DEVICE)
+    model, all_item_emb = load_model(model_path, device=DEVICE)
     elapsed = time.time() - t0
 
     state["model"]        = model
