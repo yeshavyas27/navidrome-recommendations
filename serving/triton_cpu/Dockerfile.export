@@ -1,14 +1,21 @@
 # One-time ONNX export container
-# Run this once to generate the ONNX model file for Triton.
+# Converts best_gru4rec.pt → model.onnx for Triton
+#
+# Build and run:
+#   docker build -f serving/triton_cpu/Dockerfile.export -t gru4rec-export .
+#   docker run -v $(pwd)/artifacts:/app/artifacts \
+#              -v $(pwd)/serving/triton_cpu/model_repository:/app/model_repository \
+#              gru4rec-export
+
 FROM python:3.11-slim
 
-WORKDIR /workspace
+WORKDIR /app
 
-RUN pip install --no-cache-dir torch==2.1.0 numpy==1.26.4 onnx==1.15.0
+RUN pip install --no-cache-dir torch==2.1.2 numpy==1.26.4 onnx==1.15.0 onnxruntime==1.17.0 onnxscript
 
-COPY export_onnx.py .
+COPY serving/_shared/ _shared/
+COPY serving/triton_cpu/export_onnx.py .
 
-# Create output directory
-RUN mkdir -p model_repository/song_recommender/1
+RUN mkdir -p model_repository/gru4rec_encoder/1
 
 CMD ["python", "export_onnx.py"]

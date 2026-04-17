@@ -28,10 +28,12 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-# Make _shared importable
-_SERVING_ROOT = Path(__file__).resolve().parent.parent
-if str(_SERVING_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SERVING_ROOT))
+# Make _shared importable (works both locally and in Docker)
+_SCRIPT_DIR = Path(__file__).resolve().parent
+for candidate in [_SCRIPT_DIR.parent, _SCRIPT_DIR]:  # serving/ or /app/
+    if (candidate / "_shared" / "model.py").exists():
+        sys.path.insert(0, str(candidate))
+        break
 
 from _shared.model import load_model
 
@@ -90,8 +92,22 @@ class GRU4RecEncoder(nn.Module):
 # ── Export ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    ckpt_path = Path(__file__).resolve().parents[2] / "artifacts" / "best_gru4rec.pt"
+    # Check multiple locations for the checkpoint (local dev vs Docker)
+    for candidate in [
+        Path(__file__).resolve().parents[2] / "artifacts" / "best_gru4rec.pt",  # local
+        Path("/app/artifacts/best_gru4rec.pt"),                                  # Docker
+    ]:
+        if candidate.exists():
+            ckpt_path = candidate
+            break
+    else:
+        print("ERROR: best_gru4rec.pt not found", file=sys.stderr)
+        sys.exit(1)
+
     out_dir = Path(__file__).resolve().parent / "model_repository" / "gru4rec_encoder" / "1"
+    # Also check Docker path
+    if not out_dir.parent.parent.exists():
+        out_dir = Path("/app/model_repository/gru4rec_encoder/1")
     out_dir.mkdir(parents=True, exist_ok=True)
     onnx_path = out_dir / "model.onnx"
 
