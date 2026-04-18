@@ -61,7 +61,7 @@ VOCAB_PATH     = os.environ.get(
 MODEL_VERSION  = os.environ.get("MODEL_VERSION", "best_gru4rec")
 
 # MLflow: if set, pull model artifact from MLflow instead of local file.
-# Set MLFLOW_TRACKING_URI to enable (e.g. http://129.114.25.168:8000).
+# Set MLFLOW_TRACKING_URI to enable (e.g. http://129.114.27.204:8000).
 MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "")
 MLFLOW_EXPERIMENT   = os.environ.get("MLFLOW_EXPERIMENT", "30music-session-recommendation")
 MLFLOW_ARTIFACT     = os.environ.get("MLFLOW_ARTIFACT", "best_gru4rec.pt")

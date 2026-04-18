@@ -78,7 +78,7 @@ From MLflow:
 ```bash
 mkdir -p artifacts
 curl -o artifacts/best_gru4rec.pt \
-  'http://129.114.25.168:8000/get-artifact?run_id=50d806ff55c74f1ca1f3eaa81fea177e&path=best_gru4rec.pt'
+  'http://129.114.27.204:8000/get-artifact?run_id=50d806ff55c74f1ca1f3eaa81fea177e&path=best_gru4rec.pt'
 ```
 
 Vocab file from training team (Yesha's cached vocabs):
@@ -149,7 +149,7 @@ With MLflow auto-fetch:
 ```bash
 docker run -d -p 8000:8000 \
   -v $(pwd)/../../artifacts:/app/artifacts \
-  -e MLFLOW_TRACKING_URI=http://129.114.25.168:8000 \
+  -e MLFLOW_TRACKING_URI=http://129.114.27.204:8000 \
   baseline
 ```
 
