@@ -4,3 +4,4 @@ pydantic==2.9.0
 torch==2.1.2
 numpy==1.26.4
 prometheus_client==0.20.0
+requests==2.31.0

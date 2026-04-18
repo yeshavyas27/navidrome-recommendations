@@ -1,18 +1,22 @@
-# Base image with Python 
+# GRU4Rec serving container for K8s deployment
+#
+# Build:  docker build -f serving/baseline/Dockerfile -t navidrome-serve .
+# Run:    docker run -d -p 8080:8080 -v $(pwd)/artifacts:/app/artifacts navidrome-serve
+#
+# Required env vars (Salauat injects these in K8s):
+#   MLFLOW_TRACKING_URI  — e.g. http://mlflow.navidrome-platform.svc.cluster.local:8000
+#   VOCAB_PATH           — path to vocabs.pkl (default: /app/artifacts/vocabs.pkl)
+
 FROM python:3.11-slim
 
-# Set working directory inside the container
 WORKDIR /app
 
-# Install dependencies first (cached if requirements don't change)
-COPY requirements.txt .
+COPY serving/baseline/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the serving code
-COPY app.py .
+COPY serving/_shared/ _shared/
+COPY serving/baseline/app.py .
 
-# Expose port 8000 for FastAPI
-EXPOSE 8000
+EXPOSE 8080
 
-# Start the FastAPI server (like the lab used uvicorn)
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
