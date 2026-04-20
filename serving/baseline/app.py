@@ -595,12 +595,30 @@ def recommend_by_tracks(request: TrackRecommendRequest, http_request: Request):
                 OOV_ITEMS.inc(oov_count)
                 log.warning(f"request_id={request_id} unknown_tracks={oov_count}")
 
+            # Cold-start seed fallback: if no usable seeds (empty input, or all
+            # OOV — e.g. Navidrome library has no 30Music-tagged tracks yet),
+            # inject a random sample from the top-100 most popular items so the
+            # model has something to condition on. The cold-start blender will
+            # dial alpha toward popularity anyway given the short prefix.
             if not clean_prefix:
-                REQUESTS.labels(status="400").inc()
-                raise HTTPException(
-                    status_code=400,
-                    detail="None of the provided track_ids exist in the model vocabulary.",
-                )
+                blender = state.get("cold_start")
+                if blender is not None and getattr(blender, "_pop", None) is not None:
+                    # _pop is 0-indexed; vocab item_idx is 1-based (idx = position + 1).
+                    import random as _random
+                    top_k = min(100, blender._pop.shape[0])
+                    top_positions = torch.topk(blender._pop, k=top_k).indices.tolist()
+                    sampled = _random.sample(top_positions, k=min(3, top_k))
+                    clean_prefix = [p + 1 for p in sampled if (p + 1) in idx2item]
+                    log.info(
+                        f"request_id={request_id} cold_start_seed=popularity "
+                        f"sampled={len(clean_prefix)}"
+                    )
+                if not clean_prefix:
+                    REQUESTS.labels(status="400").inc()
+                    raise HTTPException(
+                        status_code=400,
+                        detail="No usable seeds and no popularity fallback available.",
+                    )
 
             # Translate exclude track IDs too
             exclude = set()
