@@ -26,7 +26,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -37,6 +39,7 @@ import pickle
 
 import torch
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
 
@@ -64,6 +67,13 @@ MODEL_VERSION  = os.environ.get("MODEL_VERSION", "best_gru4rec")
 # Track metadata: MinIO bucket with track_id → title, artist mapping.
 TRACK_META_BUCKET = os.environ.get("TRACK_META_BUCKET", "navidrome-metadata")
 TRACK_META_KEY    = os.environ.get("TRACK_META_KEY", "track_dict.parquet")
+
+# Audio cache: Swift bucket holding track_id → mp3 bytes for /play streaming.
+# Populated lazily on cache miss and by scripts/warmup_cache.py.
+AUDIO_BUCKET        = os.environ.get("AUDIO_BUCKET", "audio-cache")
+AUDIO_KEY_PREFIX    = os.environ.get("AUDIO_KEY_PREFIX", "audio/")
+AUDIO_PRESIGN_TTL   = int(os.environ.get("AUDIO_PRESIGN_TTL", "3600"))
+AUDIO_DOWNLOAD_TIMEOUT = int(os.environ.get("AUDIO_DOWNLOAD_TIMEOUT", "120"))
 
 # MLflow: if set, pull model artifact from MLflow instead of local file.
 MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "")
@@ -132,6 +142,24 @@ MODEL_INFO = Gauge(
 COLD_START_ACTIVATIONS = Counter(
     "recommend_cold_start_activations_total",
     "Requests where cold-start blending was applied (alpha < 1.0).",
+)
+PLAY_CACHE_HITS = Counter(
+    "play_cache_hits_total",
+    "/play requests served from Swift cache (no yt-dlp fetch).",
+)
+PLAY_CACHE_MISSES = Counter(
+    "play_cache_misses_total",
+    "/play requests that triggered a live audio fetch.",
+)
+PLAY_DOWNLOAD_DURATION = Histogram(
+    "play_download_seconds",
+    "yt-dlp fetch + Swift upload time on cache miss.",
+    buckets=(1, 2, 5, 10, 20, 30, 60, 120),
+)
+PLAY_DOWNLOAD_ERRORS = Counter(
+    "play_download_errors_total",
+    "/play cache-miss fetches that failed.",
+    ["reason"],
 )
 
 
@@ -645,3 +673,125 @@ def recommend_by_tracks(request: TrackRecommendRequest, http_request: Request):
         REQUESTS.labels(status="500").inc()
         log.exception(f"request_id={request_id} inference_failed: {e}")
         raise HTTPException(status_code=500, detail="internal error")
+
+
+# ─── audio cache (/play) ─────────────────────────────────────────────────
+def _audio_s3_client():
+    """boto3 client against the Swift/MinIO endpoint. Cached in state."""
+    if "audio_s3" in state:
+        return state["audio_s3"]
+    endpoint = MINIO_URL or os.environ.get("S3_ENDPOINT_URL", "")
+    access   = MINIO_USER or os.environ.get("AWS_ACCESS_KEY_ID", "")
+    secret   = MINIO_PASSWORD or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    if not endpoint:
+        return None
+    import boto3
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access,
+        aws_secret_access_key=secret,
+        region_name="us-east-1",
+    )
+    state["audio_s3"] = client
+    return client
+
+
+def _lookup_track_meta(track_id: str) -> dict:
+    """track_meta keys may be int or str depending on parquet dtype."""
+    meta = state.get("track_meta", {})
+    if track_id in meta:
+        return meta[track_id]
+    try:
+        return meta.get(int(track_id), {})
+    except (ValueError, TypeError):
+        return {}
+
+
+def _audio_cache_key(track_id: str) -> str:
+    return f"{AUDIO_KEY_PREFIX}{track_id}.mp3"
+
+
+def _audio_cached(s3, track_id: str) -> bool:
+    try:
+        s3.head_object(Bucket=AUDIO_BUCKET, Key=_audio_cache_key(track_id))
+        return True
+    except Exception:
+        return False
+
+
+def _fetch_audio_from_youtube(title: str, artist: str) -> bytes:
+    """Run yt-dlp, return mp3 bytes. Raises on failure."""
+    query = f"ytsearch1:{title} {artist}".strip()
+    with tempfile.TemporaryDirectory() as td:
+        out_template = str(Path(td) / "audio.%(ext)s")
+        subprocess.run(
+            [
+                "yt-dlp", "--no-playlist", "--quiet", "--no-warnings",
+                "-x", "--audio-format", "mp3", "--audio-quality", "5",
+                "-o", out_template,
+                query,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=AUDIO_DOWNLOAD_TIMEOUT,
+        )
+        mp3_files = list(Path(td).glob("*.mp3"))
+        if not mp3_files:
+            raise RuntimeError("yt-dlp produced no mp3")
+        return mp3_files[0].read_bytes()
+
+
+@app.get("/play/{track_id}")
+def play(track_id: str):
+    """Redirect the browser to a presigned Swift URL for this track's audio.
+
+    Cache miss → yt-dlp ingest from public sources → upload to Swift → redirect.
+    Cache hit  → presign immediately.
+    """
+    s3 = _audio_s3_client()
+    if s3 is None:
+        raise HTTPException(status_code=503, detail="Audio storage not configured")
+
+    if _audio_cached(s3, track_id):
+        PLAY_CACHE_HITS.inc()
+    else:
+        PLAY_CACHE_MISSES.inc()
+        meta = _lookup_track_meta(track_id)
+        title  = meta.get("title", "").strip()
+        artist = meta.get("artist", "").strip()
+        if not title:
+            raise HTTPException(status_code=404, detail=f"No metadata for track_id={track_id}")
+
+        log.info(f"play cache-miss track_id={track_id} query='{title} — {artist}'")
+        t0 = time.time()
+        try:
+            audio_bytes = _fetch_audio_from_youtube(title, artist)
+        except subprocess.TimeoutExpired:
+            PLAY_DOWNLOAD_ERRORS.labels(reason="timeout").inc()
+            raise HTTPException(status_code=504, detail="Audio fetch timed out")
+        except subprocess.CalledProcessError as e:
+            PLAY_DOWNLOAD_ERRORS.labels(reason="yt_dlp_failed").inc()
+            stderr = e.stderr.decode(errors="ignore")[:200] if e.stderr else str(e)
+            log.warning(f"yt-dlp failed track_id={track_id}: {stderr}")
+            raise HTTPException(status_code=502, detail="Audio fetch failed")
+        except Exception as e:
+            PLAY_DOWNLOAD_ERRORS.labels(reason="other").inc()
+            log.exception(f"audio fetch error track_id={track_id}: {e}")
+            raise HTTPException(status_code=500, detail="Audio fetch error")
+        PLAY_DOWNLOAD_DURATION.observe(time.time() - t0)
+
+        s3.put_object(
+            Bucket=AUDIO_BUCKET,
+            Key=_audio_cache_key(track_id),
+            Body=audio_bytes,
+            ContentType="audio/mpeg",
+        )
+        log.info(f"play cached track_id={track_id} size={len(audio_bytes)/1e6:.1f}MB")
+
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": AUDIO_BUCKET, "Key": _audio_cache_key(track_id)},
+        ExpiresIn=AUDIO_PRESIGN_TTL,
+    )
+    return RedirectResponse(url=url, status_code=302)
