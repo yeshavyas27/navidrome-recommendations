@@ -766,14 +766,27 @@ def _audio_cached(s3, track_id: str) -> bool:
         return False
 
 
+def _list_audio_keys(s3, max_keys: int = 1000) -> list[str]:
+    """List up to max_keys audio object keys under the AUDIO_KEY_PREFIX."""
+    try:
+        resp = s3.list_objects_v2(
+            Bucket=AUDIO_BUCKET, Prefix=AUDIO_KEY_PREFIX, MaxKeys=max_keys
+        )
+        return [obj["Key"] for obj in resp.get("Contents", [])]
+    except Exception as e:
+        log.warning(f"audio bucket list failed: {e}")
+        return []
+
+
 @app.get("/play/{track_id}")
 def play(track_id: str):
     """Redirect the browser to a presigned Swift URL for this track's audio.
 
     Cache hit  → presigned URL for the track's own mp3.
-    Cache miss → presigned URL for AUDIO_FALLBACK_TRACK_ID's mp3 (demo
-                 fallback — the UI still shows the correct title/artist
-                 from track_dict, only the audio content is substituted).
+    Cache miss → presigned URL for a random mp3 in the bucket (demo
+                 fallback — we only have ~2k audio files from the catalog
+                 but the UI still shows the correct title/artist from
+                 track_dict for whatever row was clicked).
     """
     s3 = _audio_s3_client()
     if s3 is None:
@@ -784,7 +797,14 @@ def play(track_id: str):
         PLAY_CACHE_HITS.inc()
     else:
         PLAY_CACHE_MISSES.inc()
-        key = _audio_cache_key(AUDIO_FALLBACK_TRACK_ID)
+        keys = _list_audio_keys(s3)
+        if not keys:
+            raise HTTPException(
+                status_code=404,
+                detail="No audio available in cache bucket",
+            )
+        import random as _random
+        key = _random.choice(keys)
         log.info(f"play fallback track_id={track_id} -> {key}")
 
     url = s3.generate_presigned_url(
