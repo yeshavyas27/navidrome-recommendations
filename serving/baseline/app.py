@@ -332,18 +332,29 @@ async def lifespan(app: FastAPI):
     state["idx2item"] = idx2item
     log.info(f"Vocab loaded: {len(item2idx)} items, {len(user2idx)} users")
 
-    # Load track metadata (title, artist) from MinIO if available.
+    # Load track metadata (title, artist) from MinIO.
     # Uses MINIO_URL/USER/PASSWORD (same creds as model fetch).
+    # Keys are forced to str to match idx2item downstream — parquet track_id
+    # column is int64, idx2item returns strings, so without normalization
+    # every lookup would miss and the UI would show empty names.
     _meta_minio_url = MINIO_URL or os.environ.get("S3_ENDPOINT_URL", "")
     _meta_minio_user = MINIO_USER or os.environ.get("AWS_ACCESS_KEY_ID", "")
     _meta_minio_pass = MINIO_PASSWORD or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
     state["track_meta"] = {}
-    if _meta_minio_url:
+    if not _meta_minio_url:
+        log.error(
+            "Track metadata NOT loaded: no S3 endpoint configured. "
+            "Set MINIO_URL or S3_ENDPOINT_URL. Recommendations will have no title/artist."
+        )
+    else:
         try:
             import boto3
             import pyarrow.parquet as pq
             import io as _io
-            log.info(f"Loading track metadata from MinIO ({TRACK_META_BUCKET}/{TRACK_META_KEY}) ...")
+            log.info(
+                f"Loading track metadata: s3://{TRACK_META_BUCKET}/{TRACK_META_KEY} "
+                f"from {_meta_minio_url} ..."
+            )
             _s3 = boto3.client("s3",
                 endpoint_url=_meta_minio_url,
                 aws_access_key_id=_meta_minio_user,
@@ -352,19 +363,33 @@ async def lifespan(app: FastAPI):
             )
             _obj = _s3.get_object(Bucket=TRACK_META_BUCKET, Key=TRACK_META_KEY)
             _table = pq.read_table(_io.BytesIO(_obj["Body"].read()))
+            _cols = set(_table.column_names)
+            for _req in ("track_id", "title", "artist"):
+                if _req not in _cols:
+                    raise RuntimeError(
+                        f"track_dict.parquet missing required column '{_req}'. "
+                        f"Found columns: {sorted(_cols)}"
+                    )
             _tids = _table.column("track_id")
             _titles = _table.column("title")
             _artists = _table.column("artist")
             track_meta = {}
             for i in range(len(_tids)):
-                track_meta[_tids[i].as_py()] = {
+                track_meta[str(_tids[i].as_py())] = {
                     "title": _titles[i].as_py() or "",
                     "artist": _artists[i].as_py() or "",
                 }
             state["track_meta"] = track_meta
-            log.info(f"Track metadata loaded: {len(track_meta)} tracks")
+            log.info(
+                f"Track metadata loaded: {len(track_meta)} tracks "
+                f"(keys normalized to str)"
+            )
         except Exception as e:
-            log.warning(f"Failed to load track metadata: {e}")
+            log.error(
+                f"Track metadata load FAILED: {type(e).__name__}: {e}. "
+                f"Bucket={TRACK_META_BUCKET} Key={TRACK_META_KEY} "
+                f"Endpoint={_meta_minio_url}. Recommendations will have no names."
+            )
 
     # Load model: MinIO > MLflow > local file.
     model_path = MODEL_PATH
