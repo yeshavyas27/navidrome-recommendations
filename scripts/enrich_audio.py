@@ -28,11 +28,13 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import logging
 import os
 import pickle  # noqa: F401
 import re
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -51,6 +53,7 @@ class Config:
     audio_bucket:      str
     audio_prefix:      str
     complete_prefix:   str
+    manifest_key:      str
     meta_bucket:       str
     meta_key:          str
     concurrency:       int
@@ -154,7 +157,8 @@ def _embed_id3(audio_bytes: bytes, track_id: str, title: str, artist: str) -> by
         _os.unlink(tmp_path)
 
 
-def process_one(s3, cfg: Config, meta: dict, src_key: str, stats: dict) -> None:
+def process_one(s3, cfg: Config, meta: dict, src_key: str, stats: dict,
+                manifest: dict, manifest_lock: threading.Lock) -> None:
     track_id = _track_id_from_key(src_key)
     if not track_id:
         stats["bad_name"] += 1
@@ -162,6 +166,18 @@ def process_one(s3, cfg: Config, meta: dict, src_key: str, stats: dict) -> None:
 
     if not cfg.overwrite and _already_enriched(s3, cfg, track_id):
         stats["skipped_exists"] += 1
+        # Still record in manifest so Salauat can see this track is present
+        with manifest_lock:
+            if track_id not in manifest:
+                m = meta.get(str(track_id), {})
+                manifest[track_id] = {
+                    "track_id":       track_id,
+                    "title":          m.get("title", ""),
+                    "artist":         m.get("artist", ""),
+                    "enriched_key":   _dest_key(cfg, track_id),
+                    "source_key":     src_key,
+                    "status":         "already_enriched",
+                }
         return
 
     m = meta.get(str(track_id), {})
@@ -170,9 +186,12 @@ def process_one(s3, cfg: Config, meta: dict, src_key: str, stats: dict) -> None:
     if not title and not artist:
         stats["no_metadata"] += 1
         # still copy, but without tags
+
     try:
         obj = s3.get_object(Bucket=cfg.audio_bucket, Key=src_key)
         body = obj["Body"].read()
+        source_size = obj.get("ContentLength", len(body))
+        source_last_modified = obj.get("LastModified")
     except Exception as e:
         log.warning(f"download failed {src_key}: {e}")
         stats["download_failed"] += 1
@@ -180,11 +199,12 @@ def process_one(s3, cfg: Config, meta: dict, src_key: str, stats: dict) -> None:
 
     try:
         new_bytes = _embed_id3(body, track_id, title, artist)
+        tags_written = True
     except Exception as e:
         log.warning(f"tag-write failed {src_key}: {e}")
         stats["tag_failed"] += 1
-        # fall back to uploading the raw bytes unchanged
         new_bytes = body
+        tags_written = False
 
     try:
         s3.put_object(
@@ -198,6 +218,21 @@ def process_one(s3, cfg: Config, meta: dict, src_key: str, stats: dict) -> None:
         log.warning(f"upload failed {src_key}: {e}")
         stats["upload_failed"] += 1
         return
+
+    with manifest_lock:
+        manifest[track_id] = {
+            "track_id":             track_id,
+            "title":                title,
+            "artist":               artist,
+            "musicbrainz_trackid":  track_id,
+            "enriched_key":         _dest_key(cfg, track_id),
+            "source_key":           src_key,
+            "source_size_bytes":    source_size,
+            "source_last_modified": (source_last_modified.isoformat()
+                                     if source_last_modified else None),
+            "id3_tags_written":     tags_written,
+            "status":               "enriched",
+        }
 
     stats["enriched"] += 1
     if stats["enriched"] % 100 == 0:
@@ -218,13 +253,44 @@ def run(cfg: Config) -> None:
         "tag_failed":      0,
         "upload_failed":   0,
     }
+    manifest: dict[str, dict] = {}
+    manifest_lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=cfg.concurrency) as pool:
-        futures = [pool.submit(process_one, s3, cfg, meta, k, stats) for k in keys]
+        futures = [
+            pool.submit(process_one, s3, cfg, meta, k, stats, manifest, manifest_lock)
+            for k in keys
+        ]
         for _ in as_completed(futures):
             pass
 
     log.info(f"DONE: {stats}")
+
+    # Upload manifest — one JSON file Salauat can open to see what metadata
+    # each enriched audio carries, without having to pull mp3 bytes.
+    manifest_doc = {
+        "version":       1,
+        "track_count":   len(manifest),
+        "stats":         stats,
+        "audio_bucket":  cfg.audio_bucket,
+        "audio_prefix":  cfg.complete_prefix,
+        "source_prefix": cfg.audio_prefix,
+        "tracks":        manifest,
+    }
+    manifest_bytes = json.dumps(manifest_doc, indent=2, default=str).encode()
+    try:
+        s3.put_object(
+            Bucket=cfg.audio_bucket,
+            Key=cfg.manifest_key,
+            Body=manifest_bytes,
+            ContentType="application/json",
+        )
+        log.info(
+            f"Wrote manifest: s3://{cfg.audio_bucket}/{cfg.manifest_key} "
+            f"({len(manifest_bytes)/1024:.1f} KB, {len(manifest)} tracks)"
+        )
+    except Exception as e:
+        log.error(f"manifest upload failed: {e}")
 
 
 def parse_args() -> Config:
@@ -232,6 +298,8 @@ def parse_args() -> Config:
     p.add_argument("--audio-bucket", default=os.environ.get("AUDIO_BUCKET", "audio-cache"))
     p.add_argument("--audio-prefix",    default="audio/")
     p.add_argument("--complete-prefix", default="audio_complete/")
+    p.add_argument("--manifest-key",    default="audio_complete/manifest.json",
+                   help="Where to write the human-readable JSON manifest.")
     p.add_argument("--meta-bucket", default=os.environ.get("TRACK_META_BUCKET", "navidrome-metadata"))
     p.add_argument("--meta-key",    default=os.environ.get("TRACK_META_KEY", "track_dict.parquet"))
     p.add_argument("--concurrency", type=int, default=8)
@@ -253,6 +321,7 @@ def parse_args() -> Config:
         audio_bucket=a.audio_bucket,
         audio_prefix=a.audio_prefix,
         complete_prefix=a.complete_prefix,
+        manifest_key=a.manifest_key,
         meta_bucket=a.meta_bucket,
         meta_key=a.meta_key,
         concurrency=a.concurrency,
