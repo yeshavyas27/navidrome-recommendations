@@ -1,0 +1,104 @@
+# Standalone copy of the serving + training alert rules, extracted from
+# salawhaaat/navidrome-iac/k8s/monitoring/templates/prometheus-rules.yaml
+# with Helm template variables removed so promtool can parse it directly.
+#
+# This is the TEST version of the rules. The live cluster version is in
+# the iac repo — these two must stay in sync (see alert_rules_test.yaml
+# for the test cases that exercise both).
+
+groups:
+  - name: serving.rules
+    interval: 15s
+    rules:
+      - alert: ServingErrorRateCritical
+        expr: rate(recommend_requests_total{status="500"}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: navidrome-serve
+          action: rollback
+        annotations:
+          summary: "navidrome-serve 500-rate > 5% for 5m"
+
+      - alert: ServingLatencyP95Critical
+        expr: histogram_quantile(0.95, rate(recommend_latency_seconds_bucket[5m])) > 1.0
+        for: 5m
+        labels:
+          severity: critical
+          service: navidrome-serve
+          action: rollback
+        annotations:
+          summary: "navidrome-serve p95 latency > 1s for 5m"
+
+      - alert: ColdStartSurge
+        expr: |
+          rate(recommend_cold_start_activations_total[10m])
+            / rate(recommend_requests_total[10m]) > 0.30
+        for: 10m
+        labels:
+          severity: warning
+          service: navidrome-serve
+        annotations:
+          summary: "Cold-start fallback firing on > 30% of requests"
+
+      - alert: OOVRateHigh
+        expr: |
+          rate(recommend_oov_items_total[10m])
+            / rate(recommend_requests_total[10m]) > 5
+        for: 10m
+        labels:
+          severity: warning
+          service: navidrome-serve
+        annotations:
+          summary: "OOV items per request > 5 for 10m"
+
+      - alert: PlayCacheHitRateLow
+        expr: |
+          rate(play_cache_hits_total[30m])
+            / (rate(play_cache_hits_total[30m]) + rate(play_cache_misses_total[30m])) < 0.3
+        for: 30m
+        labels:
+          severity: warning
+          service: navidrome-serve
+        annotations:
+          summary: "/play cache hit rate < 30% for 30m"
+
+      - alert: NavidromeServeDown
+        expr: up{app="navidrome-serve"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: navidrome-serve
+        annotations:
+          summary: "navidrome-serve /metrics endpoint unreachable"
+
+  - name: training.rules
+    interval: 15s
+    rules:
+      - alert: FinetuneRegression
+        expr: gru4rec_safeguard_hr_delta < -0.05
+        for: 0m
+        labels:
+          severity: warning
+          service: training
+          action: review
+        annotations:
+          summary: "Last finetune dropped HR@10 > 5pp vs previous best"
+
+      - alert: FinetuneDataQualityFailed
+        expr: gru4rec_safeguard_data_quality_passed == 0
+        for: 0m
+        labels:
+          severity: warning
+          service: training
+        annotations:
+          summary: "Finetune run flagged data-quality issues"
+
+      - alert: PopularityConcentrationHigh
+        expr: gru4rec_safeguard_popularity_share > 0.7
+        for: 10m
+        labels:
+          severity: warning
+          service: training
+        annotations:
+          summary: "> 70% of training interactions in top-10% items"

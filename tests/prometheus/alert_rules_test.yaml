@@ -1,0 +1,128 @@
+# promtool test cases for serving + training alert rules.
+#
+# Run:
+#     brew install prometheus       # if you don't already have promtool
+#     promtool test rules tests/prometheus/alert_rules_test.yaml
+#
+# Output on success:
+#     SUCCESS
+#
+# Each test defines synthetic metric values over time and asserts that
+# alerts fire (or don't) at a specific evaluation time. This is the same
+# kind of unit test Prometheus uses for its own rules internally.
+
+rule_files:
+  - alert_rules.yaml
+
+tests:
+  # ─── 1. Safeguard metrics (training.rules) ───
+  # These fire instantly (for: 0m) when threshold crossed.
+
+  - interval: 1m
+    name: "FinetuneDataQualityFailed fires when data_quality_passed == 0"
+    input_series:
+      - series: 'gru4rec_safeguard_data_quality_passed{run_type="finetune",data_version="bad-run",mlflow_run_id="r-1"}'
+        values: '1 1 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: FinetuneDataQualityFailed
+        exp_alerts: []            # value still 1, no alert
+      - eval_time: 2m
+        alertname: FinetuneDataQualityFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: training
+              alertname: FinetuneDataQualityFailed
+              run_type: finetune
+              data_version: bad-run
+              mlflow_run_id: r-1
+            exp_annotations:
+              summary: "Finetune run flagged data-quality issues"
+
+  - interval: 1m
+    name: "FinetuneRegression fires when hr_delta < -0.05"
+    input_series:
+      - series: 'gru4rec_safeguard_hr_delta{run_type="finetune",mlflow_run_id="r-regression"}'
+        values: '0.01 0.02 -0.07'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: FinetuneRegression
+        exp_alerts: []            # +0.02 delta, no alert
+      - eval_time: 2m
+        alertname: FinetuneRegression
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: training
+              action: review
+              alertname: FinetuneRegression
+              run_type: finetune
+              mlflow_run_id: r-regression
+            exp_annotations:
+              summary: "Last finetune dropped HR@10 > 5pp vs previous best"
+
+  - interval: 1m
+    name: "PopularityConcentrationHigh fires after 10m of > 0.7"
+    input_series:
+      - series: 'gru4rec_safeguard_popularity_share{run_type="finetune"}'
+        values: '0.8x12'            # sustained 0.8 for 12 minutes
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PopularityConcentrationHigh
+        exp_alerts: []            # not yet — needs for: 10m
+      - eval_time: 11m
+        alertname: PopularityConcentrationHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: training
+              alertname: PopularityConcentrationHigh
+              run_type: finetune
+            exp_annotations:
+              summary: "> 70% of training interactions in top-10% items"
+
+  # ─── 2. Serving SLI rules (serving.rules) ───
+
+  - interval: 1m
+    name: "NavidromeServeDown fires when up == 0"
+    input_series:
+      - series: 'up{app="navidrome-serve",instance="10.0.0.1:8080"}'
+        values: '1 1 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: NavidromeServeDown
+        exp_alerts: []            # still up
+      - eval_time: 5m
+        alertname: NavidromeServeDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: navidrome-serve
+              alertname: NavidromeServeDown
+              app: navidrome-serve
+              instance: 10.0.0.1:8080
+            exp_annotations:
+              summary: "navidrome-serve /metrics endpoint unreachable"
+
+  # ─── 3. Negative tests (alerts should NOT fire) ───
+
+  - interval: 1m
+    name: "FinetuneDataQualityFailed stays quiet when passed == 1"
+    input_series:
+      - series: 'gru4rec_safeguard_data_quality_passed{run_type="finetune"}'
+        values: '1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FinetuneDataQualityFailed
+        exp_alerts: []
+
+  - interval: 1m
+    name: "FinetuneRegression stays quiet on small negative delta"
+    input_series:
+      - series: 'gru4rec_safeguard_hr_delta{run_type="finetune"}'
+        values: '-0.02 -0.03 -0.04'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FinetuneRegression
+        exp_alerts: []
