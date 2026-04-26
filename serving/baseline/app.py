@@ -64,25 +64,24 @@ VOCAB_PATH     = os.environ.get(
 )
 MODEL_VERSION  = os.environ.get("MODEL_VERSION", "best_gru4rec")
 
-# Track metadata: MinIO bucket with track_id → title, artist mapping.
-TRACK_META_BUCKET = os.environ.get("TRACK_META_BUCKET", "navidrome-metadata")
-TRACK_META_KEY    = os.environ.get("TRACK_META_KEY", "track_dict.parquet")
+# Track metadata: bucket holding track_id → title, artist parquet.
+# Per-resource S3 endpoint (defaults to MINIO_*) — set TRACK_META_ENDPOINT_URL
+# to point at Chameleon RGW (https://chi.uc.chameleoncloud.org:7480) using
+# EC2-style credentials so the parquet is read straight from Swift.
+TRACK_META_BUCKET         = os.environ.get("TRACK_META_BUCKET", "navidrome-metadata")
+TRACK_META_KEY            = os.environ.get("TRACK_META_KEY", "track_dict.parquet")
+TRACK_META_ENDPOINT_URL   = os.environ.get("TRACK_META_ENDPOINT_URL", "")
+TRACK_META_ACCESS_KEY     = os.environ.get("TRACK_META_ACCESS_KEY", "")
+TRACK_META_SECRET_KEY     = os.environ.get("TRACK_META_SECRET_KEY", "")
 
-# Swift (Chameleon Cloud bulk storage). If app credentials are set, track_dict
-# is loaded from Swift first — durable across in-cluster MinIO wipes. MinIO
-# remains a fallback. Same auth pattern as scripts/enrich_audio_swift.py.
-SWIFT_AUTH_URL             = os.environ.get("OS_AUTH_URL", "https://chi.uc.chameleoncloud.org:5000/v3")
-SWIFT_APP_CRED_ID          = os.environ.get("OS_APPLICATION_CREDENTIAL_ID", "")
-SWIFT_APP_CRED_SECRET      = os.environ.get("OS_APPLICATION_CREDENTIAL_SECRET", "")
-SWIFT_REGION_NAME          = os.environ.get("OS_REGION_NAME", "CHI@UC")
-SWIFT_INTERFACE            = os.environ.get("OS_INTERFACE", "public")
-SWIFT_TRACK_META_CONTAINER = os.environ.get("SWIFT_TRACK_META_CONTAINER", "navidrome-bucket-proj05")
-SWIFT_TRACK_META_KEY       = os.environ.get("SWIFT_TRACK_META_KEY", "metadata/track_dict.parquet")
-
-# Audio cache: Swift bucket holding track_id → mp3 bytes for /play streaming.
-# Populated lazily on cache miss and by scripts/warmup_cache.py.
-AUDIO_BUCKET        = os.environ.get("AUDIO_BUCKET", "audio-cache")
-AUDIO_KEY_PREFIX    = os.environ.get("AUDIO_KEY_PREFIX", "audio/")
+# Audio: bucket holding track_id → mp3. Same per-resource override pattern.
+# Set AUDIO_ENDPOINT_URL to Chameleon RGW + AUDIO_KEY_PREFIX="audio_complete/"
+# + AUDIO_BUCKET="navidrome-bucket-proj05" to stream straight from Swift.
+AUDIO_BUCKET            = os.environ.get("AUDIO_BUCKET", "audio-cache")
+AUDIO_KEY_PREFIX        = os.environ.get("AUDIO_KEY_PREFIX", "audio/")
+AUDIO_ENDPOINT_URL      = os.environ.get("AUDIO_ENDPOINT_URL", "")
+AUDIO_ACCESS_KEY        = os.environ.get("AUDIO_ACCESS_KEY", "")
+AUDIO_SECRET_KEY        = os.environ.get("AUDIO_SECRET_KEY", "")
 AUDIO_PRESIGN_TTL   = int(os.environ.get("AUDIO_PRESIGN_TTL", "3600"))
 AUDIO_DOWNLOAD_TIMEOUT = int(os.environ.get("AUDIO_DOWNLOAD_TIMEOUT", "120"))
 # Demo fallback: when a recommended track_id has no audio uploaded, play this
@@ -332,38 +331,17 @@ def _fetch_model_from_minio() -> str:
     return str(local_path)
 
 
-def _fetch_track_meta_from_swift():
-    """Fetch track_dict.parquet from Chameleon Swift via app credentials.
+def _resolve_s3(prefix_url, prefix_access, prefix_secret):
+    """Pick a per-resource S3 endpoint, falling back to the global MINIO_*.
 
-    Returns the parquet bytes, or None if creds are missing or the fetch
-    fails. Swift is the durable source of truth for the 30Music dataset —
-    survives in-cluster MinIO wipes that we hit during the cluster rebuild.
+    The 'prefix_*' args are env-var-resolved values for one resource (track
+    meta or audio). If any is empty, the corresponding MINIO_* value is used.
+    Falls back further to AWS_* env vars for parity with boto3 conventions.
     """
-    if not SWIFT_APP_CRED_ID or not SWIFT_APP_CRED_SECRET:
-        return None
-    try:
-        from swiftclient.client import Connection as SwiftConnection
-        log.info(
-            f"Loading track metadata from Swift: "
-            f"swift://{SWIFT_TRACK_META_CONTAINER}/{SWIFT_TRACK_META_KEY}"
-        )
-        swift = SwiftConnection(
-            authurl=SWIFT_AUTH_URL,
-            application_credential_id=SWIFT_APP_CRED_ID,
-            application_credential_secret=SWIFT_APP_CRED_SECRET,
-            auth_version="3",
-            os_options={
-                "auth_type": "v3applicationcredential",
-                "region_name": SWIFT_REGION_NAME,
-                "interface": SWIFT_INTERFACE,
-            },
-        )
-        _h, body = swift.get_object(SWIFT_TRACK_META_CONTAINER, SWIFT_TRACK_META_KEY)
-        log.info(f"Swift track_dict fetched: {len(body) / 1e6:.1f} MB")
-        return body
-    except Exception as e:
-        log.error(f"Swift track_dict load failed: {type(e).__name__}: {e}")
-        return None
+    endpoint = prefix_url or MINIO_URL or os.environ.get("S3_ENDPOINT_URL", "")
+    access = prefix_access or MINIO_USER or os.environ.get("AWS_ACCESS_KEY_ID", "")
+    secret = prefix_secret or MINIO_PASSWORD or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    return endpoint, access, secret
 
 
 @asynccontextmanager
@@ -377,45 +355,45 @@ async def lifespan(app: FastAPI):
     state["idx2item"] = idx2item
     log.info(f"Vocab loaded: {len(item2idx)} items, {len(user2idx)} users")
 
-    # Load track metadata (title, artist).
-    # Source priority: Swift (durable) → MinIO (in-cluster cache, may be empty).
+    # Load track metadata (title, artist) from any S3-compatible endpoint.
+    # Set TRACK_META_ENDPOINT_URL/_ACCESS_KEY/_SECRET_KEY to point at Swift's
+    # RGW (https://chi.uc.chameleoncloud.org:7480) — Swift is the durable
+    # source of truth and the bucket+key default to the Chameleon layout.
+    # Falls back to MINIO_* if the per-resource override isn't set.
     # Keys are forced to str to match idx2item downstream — parquet track_id
     # column is int64, idx2item returns strings, so without normalization
     # every lookup would miss and the UI would show empty names.
     state["track_meta"] = {}
-    _parquet_bytes = _fetch_track_meta_from_swift()
-    _source = "swift" if _parquet_bytes is not None else None
-
-    if _parquet_bytes is None:
-        _meta_minio_url = MINIO_URL or os.environ.get("S3_ENDPOINT_URL", "")
-        _meta_minio_user = MINIO_USER or os.environ.get("AWS_ACCESS_KEY_ID", "")
-        _meta_minio_pass = MINIO_PASSWORD or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-        if _meta_minio_url:
-            try:
-                import boto3
-                log.info(
-                    f"Falling back to MinIO for track metadata: "
-                    f"s3://{TRACK_META_BUCKET}/{TRACK_META_KEY} from {_meta_minio_url}"
-                )
-                _s3 = boto3.client("s3",
-                    endpoint_url=_meta_minio_url,
-                    aws_access_key_id=_meta_minio_user,
-                    aws_secret_access_key=_meta_minio_pass,
-                    region_name="us-east-1",
-                )
-                _obj = _s3.get_object(Bucket=TRACK_META_BUCKET, Key=TRACK_META_KEY)
-                _parquet_bytes = _obj["Body"].read()
-                _source = "minio"
-            except Exception as e:
-                log.error(
-                    f"MinIO track_dict load failed: {type(e).__name__}: {e}. "
-                    f"Bucket={TRACK_META_BUCKET} Key={TRACK_META_KEY}"
-                )
+    _parquet_bytes = None
+    _meta_endpoint, _meta_access, _meta_secret = _resolve_s3(
+        TRACK_META_ENDPOINT_URL, TRACK_META_ACCESS_KEY, TRACK_META_SECRET_KEY,
+    )
+    if _meta_endpoint:
+        try:
+            import boto3
+            log.info(
+                f"Loading track metadata: s3://{TRACK_META_BUCKET}/{TRACK_META_KEY} "
+                f"from {_meta_endpoint}"
+            )
+            _s3 = boto3.client("s3",
+                endpoint_url=_meta_endpoint,
+                aws_access_key_id=_meta_access,
+                aws_secret_access_key=_meta_secret,
+                region_name=os.environ.get("AWS_DEFAULT_REGION", "default"),
+            )
+            _obj = _s3.get_object(Bucket=TRACK_META_BUCKET, Key=TRACK_META_KEY)
+            _parquet_bytes = _obj["Body"].read()
+        except Exception as e:
+            log.error(
+                f"track_dict load failed: {type(e).__name__}: {e}. "
+                f"Bucket={TRACK_META_BUCKET} Key={TRACK_META_KEY} "
+                f"Endpoint={_meta_endpoint}"
+            )
 
     if _parquet_bytes is None:
         log.error(
-            "Track metadata NOT loaded — Swift creds missing and MinIO fallback "
-            "unavailable. Recommendations will have no title/artist."
+            "Track metadata NOT loaded — no S3 endpoint reachable. "
+            "Recommendations will have no title/artist."
         )
     else:
         try:
@@ -440,13 +418,13 @@ async def lifespan(app: FastAPI):
                 }
             state["track_meta"] = track_meta
             log.info(
-                f"Track metadata loaded from {_source}: {len(track_meta)} tracks "
+                f"Track metadata loaded: {len(track_meta)} tracks "
                 f"(keys normalized to str)"
             )
         except Exception as e:
             log.error(
                 f"Track metadata parse FAILED: {type(e).__name__}: {e}. "
-                f"Source={_source}. Recommendations will have no names."
+                f"Recommendations will have no names."
             )
 
     # Load model: MinIO > MLflow > local file.
@@ -781,12 +759,18 @@ def recommend_by_tracks(request: TrackRecommendRequest, http_request: Request):
 
 # ─── audio cache (/play) ─────────────────────────────────────────────────
 def _audio_s3_client():
-    """boto3 client against the Swift/MinIO endpoint. Cached in state."""
+    """boto3 client for the audio bucket — Swift's RGW S3 in production.
+
+    Uses the per-resource AUDIO_ENDPOINT_URL / AUDIO_ACCESS_KEY / AUDIO_SECRET_KEY
+    when set (typical: Chameleon RGW with EC2 creds, container=navidrome-bucket-proj05,
+    prefix=audio_complete/). Falls back to MINIO_* for local/legacy setups.
+    Cached in state.
+    """
     if "audio_s3" in state:
         return state["audio_s3"]
-    endpoint = MINIO_URL or os.environ.get("S3_ENDPOINT_URL", "")
-    access   = MINIO_USER or os.environ.get("AWS_ACCESS_KEY_ID", "")
-    secret   = MINIO_PASSWORD or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    endpoint, access, secret = _resolve_s3(
+        AUDIO_ENDPOINT_URL, AUDIO_ACCESS_KEY, AUDIO_SECRET_KEY,
+    )
     if not endpoint:
         return None
     import boto3
@@ -795,7 +779,7 @@ def _audio_s3_client():
         endpoint_url=endpoint,
         aws_access_key_id=access,
         aws_secret_access_key=secret,
-        region_name="us-east-1",
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "default"),
     )
     state["audio_s3"] = client
     return client
