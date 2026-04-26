@@ -68,6 +68,17 @@ MODEL_VERSION  = os.environ.get("MODEL_VERSION", "best_gru4rec")
 TRACK_META_BUCKET = os.environ.get("TRACK_META_BUCKET", "navidrome-metadata")
 TRACK_META_KEY    = os.environ.get("TRACK_META_KEY", "track_dict.parquet")
 
+# Swift (Chameleon Cloud bulk storage). If app credentials are set, track_dict
+# is loaded from Swift first — durable across in-cluster MinIO wipes. MinIO
+# remains a fallback. Same auth pattern as scripts/enrich_audio_swift.py.
+SWIFT_AUTH_URL             = os.environ.get("OS_AUTH_URL", "https://chi.uc.chameleoncloud.org:5000/v3")
+SWIFT_APP_CRED_ID          = os.environ.get("OS_APPLICATION_CREDENTIAL_ID", "")
+SWIFT_APP_CRED_SECRET      = os.environ.get("OS_APPLICATION_CREDENTIAL_SECRET", "")
+SWIFT_REGION_NAME          = os.environ.get("OS_REGION_NAME", "CHI@UC")
+SWIFT_INTERFACE            = os.environ.get("OS_INTERFACE", "public")
+SWIFT_TRACK_META_CONTAINER = os.environ.get("SWIFT_TRACK_META_CONTAINER", "navidrome-bucket-proj05")
+SWIFT_TRACK_META_KEY       = os.environ.get("SWIFT_TRACK_META_KEY", "metadata/track_dict.parquet")
+
 # Audio cache: Swift bucket holding track_id → mp3 bytes for /play streaming.
 # Populated lazily on cache miss and by scripts/warmup_cache.py.
 AUDIO_BUCKET        = os.environ.get("AUDIO_BUCKET", "audio-cache")
@@ -321,6 +332,40 @@ def _fetch_model_from_minio() -> str:
     return str(local_path)
 
 
+def _fetch_track_meta_from_swift():
+    """Fetch track_dict.parquet from Chameleon Swift via app credentials.
+
+    Returns the parquet bytes, or None if creds are missing or the fetch
+    fails. Swift is the durable source of truth for the 30Music dataset —
+    survives in-cluster MinIO wipes that we hit during the cluster rebuild.
+    """
+    if not SWIFT_APP_CRED_ID or not SWIFT_APP_CRED_SECRET:
+        return None
+    try:
+        from swiftclient.client import Connection as SwiftConnection
+        log.info(
+            f"Loading track metadata from Swift: "
+            f"swift://{SWIFT_TRACK_META_CONTAINER}/{SWIFT_TRACK_META_KEY}"
+        )
+        swift = SwiftConnection(
+            authurl=SWIFT_AUTH_URL,
+            application_credential_id=SWIFT_APP_CRED_ID,
+            application_credential_secret=SWIFT_APP_CRED_SECRET,
+            auth_version="3",
+            os_options={
+                "auth_type": "v3applicationcredential",
+                "region_name": SWIFT_REGION_NAME,
+                "interface": SWIFT_INTERFACE,
+            },
+        )
+        _h, body = swift.get_object(SWIFT_TRACK_META_CONTAINER, SWIFT_TRACK_META_KEY)
+        log.info(f"Swift track_dict fetched: {len(body) / 1e6:.1f} MB")
+        return body
+    except Exception as e:
+        log.error(f"Swift track_dict load failed: {type(e).__name__}: {e}")
+        return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Load vocab (item2idx, user2idx) from Yesha's training cache.
@@ -332,37 +377,51 @@ async def lifespan(app: FastAPI):
     state["idx2item"] = idx2item
     log.info(f"Vocab loaded: {len(item2idx)} items, {len(user2idx)} users")
 
-    # Load track metadata (title, artist) from MinIO.
-    # Uses MINIO_URL/USER/PASSWORD (same creds as model fetch).
+    # Load track metadata (title, artist).
+    # Source priority: Swift (durable) → MinIO (in-cluster cache, may be empty).
     # Keys are forced to str to match idx2item downstream — parquet track_id
     # column is int64, idx2item returns strings, so without normalization
     # every lookup would miss and the UI would show empty names.
-    _meta_minio_url = MINIO_URL or os.environ.get("S3_ENDPOINT_URL", "")
-    _meta_minio_user = MINIO_USER or os.environ.get("AWS_ACCESS_KEY_ID", "")
-    _meta_minio_pass = MINIO_PASSWORD or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
     state["track_meta"] = {}
-    if not _meta_minio_url:
+    _parquet_bytes = _fetch_track_meta_from_swift()
+    _source = "swift" if _parquet_bytes is not None else None
+
+    if _parquet_bytes is None:
+        _meta_minio_url = MINIO_URL or os.environ.get("S3_ENDPOINT_URL", "")
+        _meta_minio_user = MINIO_USER or os.environ.get("AWS_ACCESS_KEY_ID", "")
+        _meta_minio_pass = MINIO_PASSWORD or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+        if _meta_minio_url:
+            try:
+                import boto3
+                log.info(
+                    f"Falling back to MinIO for track metadata: "
+                    f"s3://{TRACK_META_BUCKET}/{TRACK_META_KEY} from {_meta_minio_url}"
+                )
+                _s3 = boto3.client("s3",
+                    endpoint_url=_meta_minio_url,
+                    aws_access_key_id=_meta_minio_user,
+                    aws_secret_access_key=_meta_minio_pass,
+                    region_name="us-east-1",
+                )
+                _obj = _s3.get_object(Bucket=TRACK_META_BUCKET, Key=TRACK_META_KEY)
+                _parquet_bytes = _obj["Body"].read()
+                _source = "minio"
+            except Exception as e:
+                log.error(
+                    f"MinIO track_dict load failed: {type(e).__name__}: {e}. "
+                    f"Bucket={TRACK_META_BUCKET} Key={TRACK_META_KEY}"
+                )
+
+    if _parquet_bytes is None:
         log.error(
-            "Track metadata NOT loaded: no S3 endpoint configured. "
-            "Set MINIO_URL or S3_ENDPOINT_URL. Recommendations will have no title/artist."
+            "Track metadata NOT loaded — Swift creds missing and MinIO fallback "
+            "unavailable. Recommendations will have no title/artist."
         )
     else:
         try:
-            import boto3
             import pyarrow.parquet as pq
             import io as _io
-            log.info(
-                f"Loading track metadata: s3://{TRACK_META_BUCKET}/{TRACK_META_KEY} "
-                f"from {_meta_minio_url} ..."
-            )
-            _s3 = boto3.client("s3",
-                endpoint_url=_meta_minio_url,
-                aws_access_key_id=_meta_minio_user,
-                aws_secret_access_key=_meta_minio_pass,
-                region_name="us-east-1",
-            )
-            _obj = _s3.get_object(Bucket=TRACK_META_BUCKET, Key=TRACK_META_KEY)
-            _table = pq.read_table(_io.BytesIO(_obj["Body"].read()))
+            _table = pq.read_table(_io.BytesIO(_parquet_bytes))
             _cols = set(_table.column_names)
             for _req in ("track_id", "title", "artist"):
                 if _req not in _cols:
@@ -381,14 +440,13 @@ async def lifespan(app: FastAPI):
                 }
             state["track_meta"] = track_meta
             log.info(
-                f"Track metadata loaded: {len(track_meta)} tracks "
+                f"Track metadata loaded from {_source}: {len(track_meta)} tracks "
                 f"(keys normalized to str)"
             )
         except Exception as e:
             log.error(
-                f"Track metadata load FAILED: {type(e).__name__}: {e}. "
-                f"Bucket={TRACK_META_BUCKET} Key={TRACK_META_KEY} "
-                f"Endpoint={_meta_minio_url}. Recommendations will have no names."
+                f"Track metadata parse FAILED: {type(e).__name__}: {e}. "
+                f"Source={_source}. Recommendations will have no names."
             )
 
     # Load model: MinIO > MLflow > local file.
