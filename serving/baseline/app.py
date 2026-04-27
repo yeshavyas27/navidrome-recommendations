@@ -605,6 +605,48 @@ def recommend(request: RecommendRequest, http_request: Request):
         raise HTTPException(status_code=500, detail="internal error")
 
 
+# MMR diversity re-ranking. Model produces a popularity-biased ranking
+# (popular tracks have dominant embeddings → keep showing up regardless of
+# user). MMR fixes this at inference: greedily pick the next track that
+# maximises (lambda * relevance) - (1 - lambda) * max-similarity-to-already-picked,
+# which forces diversity in the final top-N. Deterministic, ~10ms, no retrain.
+MMR_LAMBDA      = float(os.environ.get("MMR_LAMBDA", "0.5"))   # 1.0 = no diversity, 0.0 = pure diversity
+MMR_CANDIDATES  = int(os.environ.get("MMR_CANDIDATES", "50"))  # how many to pull from model before re-rank
+
+
+def _mmr_rerank(indices, scores, all_item_emb, top_n: int, lambda_: float = MMR_LAMBDA):
+    """Greedy MMR over the model's candidate ranking. Returns reordered
+    (indices, scores) trimmed to top_n. Original model scores are preserved
+    in the output — only the ORDER changes — so logged scores stay meaningful.
+    """
+    K = len(indices)
+    if K <= top_n:
+        return indices, scores
+
+    # Cosine similarity matrix over candidates (K, K).
+    cand_emb = all_item_emb[list(indices)]
+    cand_norm = cand_emb / (cand_emb.norm(dim=-1, keepdim=True) + 1e-9)
+    sim = (cand_norm @ cand_norm.T).cpu().numpy()
+
+    rel = list(scores)
+    selected = [int(max(range(K), key=lambda i: rel[i]))]  # start with most relevant
+    remaining = set(range(K)) - set(selected)
+
+    while len(selected) < top_n and remaining:
+        best_i, best_score = None, -float("inf")
+        for i in remaining:
+            div_penalty = max(sim[i, j] for j in selected)
+            mmr = lambda_ * rel[i] - (1.0 - lambda_) * float(div_penalty)
+            if mmr > best_score:
+                best_score, best_i = mmr, i
+        selected.append(best_i)
+        remaining.discard(best_i)
+
+    out_indices = [indices[i] for i in selected]
+    out_scores  = [scores[i]  for i in selected]
+    return out_indices, out_scores
+
+
 # ─── track-ID-based endpoint (for Navidrome integration) ────────────────
 class TrackRecommendRequest(BaseModel):
     """Simpler input schema for callers that only know track IDs.
@@ -612,7 +654,10 @@ class TrackRecommendRequest(BaseModel):
 
     session_id:         str = "unknown"
     user_id:            int | str = 0
-    track_ids:          list[str] = Field(min_length=1, max_length=MAX_PREFIX_LEN)
+    # min_length=0 lets brand-new users (no plays yet) reach the handler;
+    # the cold-start seed fallback below samples from popularity so the
+    # response is "popular tracks" instead of "no recommendations yet".
+    track_ids:          list[str] = Field(default_factory=list, max_length=MAX_PREFIX_LEN)
     exclude_track_ids:  list[str] = Field(default_factory=list)
     top_n:              int = Field(default=20, ge=1, le=MAX_TOP_N)
 
@@ -697,6 +742,12 @@ def recommend_by_tracks(request: TrackRecommendRequest, http_request: Request):
             prefix_tensor = torch.tensor([clean_prefix], dtype=torch.long, device=DEVICE)
             user_tensor   = torch.tensor([0], dtype=torch.long, device=DEVICE)
 
+            # Pull a wider candidate set than the user asked for, then
+            # MMR-rerank to the requested top_n. Without this, popular
+            # embeddings dominate every response → "same 10 songs" across
+            # users (Yesha + Salauat reported this).
+            internal_top_n = max(MMR_CANDIDATES, request.top_n)
+
             blender = state["cold_start"]
             if blender is not None:
                 indices, scores, alphas = blender.predict(
@@ -704,7 +755,7 @@ def recommend_by_tracks(request: TrackRecommendRequest, http_request: Request):
                     prefix_items=prefix_tensor,
                     user_idxs=user_tensor,
                     all_item_emb=all_item_emb,
-                    top_n=request.top_n,
+                    top_n=internal_top_n,
                     exclude_sets=[exclude],
                 )
                 cs_alpha = alphas[0]
@@ -713,18 +764,30 @@ def recommend_by_tracks(request: TrackRecommendRequest, http_request: Request):
                     prefix_items=prefix_tensor,
                     user_idxs=user_tensor,
                     all_item_emb=all_item_emb,
-                    top_n=request.top_n,
+                    top_n=internal_top_n,
                     exclude_sets=[exclude],
                 )
                 cs_alpha = 1.0
 
+            # Diversity rerank if we have headroom.
+            cand_indices = list(indices[0])
+            cand_scores  = list(scores[0])
+            if len(cand_indices) > request.top_n:
+                cand_indices, cand_scores = _mmr_rerank(
+                    cand_indices, cand_scores, all_item_emb,
+                    top_n=request.top_n, lambda_=MMR_LAMBDA,
+                )
+
         if cs_alpha < 1.0:
             COLD_START_ACTIVATIONS.inc()
-        log.info(f"request_id={request_id} cold_start_alpha={cs_alpha}")
+        log.info(
+            f"request_id={request_id} cold_start_alpha={cs_alpha} "
+            f"mmr_lambda={MMR_LAMBDA} candidate_pool={internal_top_n}"
+        )
 
         track_meta = state["track_meta"]
         recs = []
-        for rank, (idx, score) in enumerate(zip(indices[0], scores[0]), start=1):
+        for rank, (idx, score) in enumerate(zip(cand_indices, cand_scores), start=1):
             tid = idx2item.get(idx, f"unknown_{idx}")
             meta = track_meta.get(tid, {})
             recs.append(Recommendation(
