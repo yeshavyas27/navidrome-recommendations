@@ -707,9 +707,13 @@ def recommend_by_tracks(request: TrackRecommendRequest, http_request: Request):
             # Cold-start seed fallback: if no usable seeds (empty input, or all
             # OOV — e.g. Navidrome library has no 30Music-tagged tracks yet),
             # inject a random sample from the top-100 most popular items so the
-            # model has something to condition on. The cold-start blender will
-            # dial alpha toward popularity anyway given the short prefix.
+            # model has something to condition on. We track this so we can
+            # honestly report cs_alpha=0.0 in the response — otherwise the
+            # blender sees a 3-track prefix and ramps alpha to 1.0, which
+            # would lie about whether the result is personalized.
+            used_seed_fallback = False
             if not clean_prefix:
+                used_seed_fallback = True
                 blender = state.get("cold_start")
                 if blender is not None and getattr(blender, "_pop", None) is not None:
                     # _pop is 0-indexed; vocab item_idx is 1-based (idx = position + 1).
@@ -768,6 +772,15 @@ def recommend_by_tracks(request: TrackRecommendRequest, http_request: Request):
                     exclude_sets=[exclude],
                 )
                 cs_alpha = 1.0
+
+            # If the prefix was synthesised from popularity (this user had
+            # no real plays), the blender's alpha is meaningless — it just
+            # reflects the synthetic prefix length. Force alpha=0.0 so the
+            # response honestly reports "popularity, not personalisation."
+            # This is computed per-request: a different user with real plays
+            # in the same instant gets their own alpha unmolested.
+            if used_seed_fallback:
+                cs_alpha = 0.0
 
             # Diversity rerank if we have headroom.
             cand_indices = list(indices[0])
