@@ -321,6 +321,11 @@ def _fetch_model_from_minio() -> str:
     cache_dir.mkdir(parents=True, exist_ok=True)
     local_path = cache_dir / key.replace("/", "_")
 
+    # Record the resolved key so /version can report what's actually loaded.
+    # The cron-finetune integration test greps the /version response for the
+    # key it just deployed via `kubectl set env MINIO_MODEL_KEY=...`.
+    state["loaded_model_key"] = key
+
     if local_path.exists():
         log.info(f"Using cached model: {local_path}")
         return str(local_path)
@@ -498,6 +503,22 @@ app.mount("/metrics", make_asgi_app())
 @app.get("/health")
 def health():
     return {"status": "ok", "model_loaded": "model" in state}
+
+
+@app.get("/version")
+def version():
+    """Report the model version + the actual MinIO/Swift key currently loaded.
+
+    Used by the cron-finetune integration test to verify the serving pod
+    picked up the model that was just deployed via
+    `kubectl set env MINIO_MODEL_KEY=...`. The test greps the response
+    body for the expected key string, so plain JSON works.
+    """
+    return {
+        "model_version":     MODEL_VERSION,
+        "loaded_model_key":  state.get("loaded_model_key", ""),
+        "model_loaded":      "model" in state,
+    }
 
 
 @app.post("/recommend", response_model=RecommendResponse)
